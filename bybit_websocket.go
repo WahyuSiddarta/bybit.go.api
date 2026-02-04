@@ -5,7 +5,9 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -42,6 +44,16 @@ func isConnectionError(err error) bool {
 	if err == nil {
 		return false
 	}
+	// Treat network timeouts as connection errors so we reconnect on stalls.
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	// Close frames/errors indicate the connection is no longer usable.
+	var closeErr *websocket.CloseError
+	if errors.As(err, &closeErr) {
+		return true
+	}
 	msg := err.Error()
 	// Check common connection errors
 	return strings.Contains(msg, "use of closed network connection") ||
@@ -49,7 +61,9 @@ func isConnectionError(err error) bool {
 		strings.Contains(msg, "broken pipe") ||
 		strings.Contains(msg, "connection is nil") ||
 		strings.Contains(strings.ToLower(msg), "not connected") ||
-		strings.Contains(strings.ToLower(msg), "write: connection")
+		strings.Contains(strings.ToLower(msg), "write: connection") ||
+		strings.Contains(strings.ToLower(msg), "i/o timeout") ||
+		strings.Contains(strings.ToLower(msg), "timeout")
 }
 
 // triggerReconnect initiates reconnection in a separate goroutine
@@ -63,6 +77,14 @@ func (b *WebSocket) triggerReconnect() {
 
 	if shuttingDown {
 		return // Don't reconnect during shutdown
+	}
+
+	// Cheap pre-check to avoid spawning extra goroutines when already reconnecting.
+	b.reconnectMux.Lock()
+	alreadyReconnecting := b.isReconnecting
+	b.reconnectMux.Unlock()
+	if alreadyReconnecting {
+		return
 	}
 
 	// Spawn reconnection in separate goroutine (not tracked by wg to avoid deadlock)
@@ -195,33 +217,33 @@ func (b *WebSocket) cleanupConnection() {
 		b.cancel()
 		b.cancel = nil // Clear cancel to signal cleanup is complete
 	}
-	// Clear ctx as well so subsequent Connect() doesn't attempt writes with a cancelled context
 	b.ctx = nil
+	b.handlerCh = nil
 	b.isConnected = false
 	if b.conn != nil {
+		b.connID++ // Invalidate in-flight goroutines tied to the old connection
 		b.conn.Close()
 		b.conn = nil
 	}
 	b.connMux.Unlock()
 }
 
-func (b *WebSocket) handleIncomingMessages() {
-	b.wg.Add(1)
-	defer b.wg.Done()
+func (b *WebSocket) handleIncomingMessages(ctx context.Context, conn *websocket.Conn, id uint64) {
 	if b.debug {
 		fmt.Println(time.Now().Format(tstamp), "Setup handle incoming message ", b.subtopic)
 	}
 	for {
-		// Check if connection is nil before attempting to read (with mutex protection)
-		b.connMux.RLock()
-		conn := b.conn
-		b.connMux.RUnlock()
-
-		if conn == nil {
+		if ctx != nil && ctx.Err() != nil {
 			if b.debug {
-				fmt.Println(time.Now().Format(tstamp), "Connection is nil, exiting message handler")
+				fmt.Println(time.Now().Format(tstamp), "Message handler context closed, exiting")
 			}
-			b.setConnected(false)
+			return
+		}
+		if conn == nil {
+			return
+		}
+		// If a newer connection exists, exit quietly.
+		if !b.isConnCurrent(id) {
 			return
 		}
 
@@ -230,9 +252,16 @@ func (b *WebSocket) handleIncomingMessages() {
 			if b.debug {
 				fmt.Println(time.Now().Format(tstamp), "Error reading:", err)
 			}
-			b.setConnected(false)
-			// Trigger centralized reconnection
-			b.triggerReconnect()
+			// Only the current connection should flip state / trigger reconnect.
+			if b.isConnCurrent(id) {
+				b.setConnected(false)
+				b.triggerReconnect()
+			}
+			return
+		}
+
+		// If the connection changed while ReadMessage unblocked, drop the message.
+		if !b.isConnCurrent(id) {
 			return
 		}
 
@@ -246,20 +275,40 @@ func (b *WebSocket) handleIncomingMessages() {
 		b.receiveMux.Unlock()
 
 		if b.onMessage != nil {
-			err := b.onMessage(string(message))
-			if err != nil {
-				fmt.Println(time.Now().Format(tstamp), "Error handling message:", err)
-				// Don't exit on message handler error, just log it
-				// The application should decide whether to disconnect
-				continue
+			// Enqueue to handler worker if configured, otherwise run inline.
+			b.connMux.RLock()
+			handlerCh := b.handlerCh
+			b.connMux.RUnlock()
+			if handlerCh != nil {
+				select {
+				case handlerCh <- string(message):
+					// queued
+				default:
+					if b.debug {
+						fmt.Println(time.Now().Format(tstamp), "Handler queue full, dropping message")
+					}
+				}
+			} else {
+				handlerErr := func() (err error) {
+					defer func() {
+						if r := recover(); r != nil {
+							err = fmt.Errorf("panic in message handler: %v", r)
+						}
+					}()
+					return b.onMessage(string(message))
+				}()
+				if handlerErr != nil {
+					fmt.Println(time.Now().Format(tstamp), "Error handling message:", handlerErr)
+					// Don't exit on message handler error, just log it
+					// The application should decide whether to disconnect
+					continue
+				}
 			}
 		}
 	}
 }
 
-func (b *WebSocket) monitorConnection() {
-	b.wg.Add(1)
-	defer b.wg.Done()
+func (b *WebSocket) monitorConnection(ctx context.Context, id uint64) {
 	ticker := time.NewTicker(DefaultMonitorInterval * time.Second)
 	defer ticker.Stop()
 	if b.debug {
@@ -272,32 +321,47 @@ func (b *WebSocket) monitorConnection() {
 	for {
 		select {
 		case <-ticker.C:
+			// If a newer connection exists, stop monitoring this one.
+			if !b.isConnCurrent(id) {
+				return
+			}
 			// Single health check: combine connection state and timeout check
 			b.connMux.RLock()
 			connected := b.isConnected
 			b.connMux.RUnlock()
 
 			if !connected {
-				b.triggerReconnect()
+				if b.isConnCurrent(id) {
+					b.triggerReconnect()
+				}
 				continue
 			}
 
 			// Check receive timeout
 			b.receiveMux.RLock()
 			lastReceive := b.lastReceive
+			lastPong := b.lastPong
 			b.receiveMux.RUnlock()
+
+			// Use last activity (either data received or pong) to avoid false stale detection
+			lastActivity := lastReceive
+			if lastPong.After(lastActivity) {
+				lastActivity = lastPong
+			}
 
 			// Only trigger reconnection if no data received for 2x pingInterval
 			// This gives enough time for at least one ping-pong cycle
 			staleTimeout := time.Duration(b.pingInterval*2) * time.Second
-			if time.Since(lastReceive) > staleTimeout {
+			if time.Since(lastActivity) > staleTimeout {
 				if b.debug {
 					fmt.Println(time.Now().Format(tstamp), "No data received within stale timeout ", b.subtopic)
 				}
-				b.setConnected(false)
-				b.triggerReconnect()
+				if b.isConnCurrent(id) {
+					b.setConnected(false)
+					b.triggerReconnect()
+				}
 			}
-		case <-b.ctx.Done():
+		case <-ctx.Done():
 			if b.debug {
 				fmt.Println(time.Now().Format(tstamp), "Exiting conn monitoring ", b.subtopic)
 			}
@@ -364,6 +428,8 @@ type WebSocket struct {
 	lastReceive    time.Time
 	lastPong       time.Time // Track last pong response for connection health
 	pingInterval   int
+	handlerQueueSz int
+	handlerCh      chan string
 	onMessage      MessageHandler
 	ctx            context.Context
 	cancel         context.CancelFunc
@@ -371,6 +437,7 @@ type WebSocket struct {
 	isConnected    bool
 	isReconnecting bool
 	isShuttingDown bool // Prevents new operations during shutdown
+	connID         uint64
 	debug          bool
 	wg             sync.WaitGroup
 	// Mutex lock hierarchy (acquire in this order to prevent deadlocks):
@@ -379,8 +446,18 @@ type WebSocket struct {
 	// 3. sendMux/receiveMux (lowest level - protects I/O operations)
 	reconnectMux sync.Mutex   // Level 1: Protects reconnection state
 	connMux      sync.RWMutex // Level 2: Protects isConnected, isShuttingDown, conn, ctx, cancel
+	dialMux      sync.Mutex   // Serializes Connect() to avoid concurrent dials
 	sendMux      sync.Mutex   // Level 3: Protects WebSocket send operations
 	receiveMux   sync.RWMutex // Level 3: Protects lastReceive and lastPong times
+}
+
+// isConnCurrent returns true if id still matches the active connection.
+// This prevents old goroutines from flipping state or triggering reconnect after a newer connection is established.
+func (b *WebSocket) isConnCurrent(id uint64) bool {
+	b.connMux.RLock()
+	current := b.connID == id && b.conn != nil
+	b.connMux.RUnlock()
+	return current
 }
 
 type WebsocketOption func(*WebSocket)
@@ -397,6 +474,14 @@ func WithMaxAliveTime(maxAliveTime string) WebsocketOption {
 	}
 }
 
+// WithHandlerQueueSize sets the buffered queue size for message handling.
+// When the queue is full, messages are dropped (and logged if debug is on).
+func WithHandlerQueueSize(size int) WebsocketOption {
+	return func(c *WebSocket) {
+		c.handlerQueueSz = size
+	}
+}
+
 func NewBybitPrivateWebSocket(url, apiKey, apiSecret string, handler MessageHandler, options ...WebsocketOption) *WebSocket {
 	c := &WebSocket{
 		url:          url,
@@ -404,6 +489,7 @@ func NewBybitPrivateWebSocket(url, apiKey, apiSecret string, handler MessageHand
 		apiSecret:    apiSecret,
 		maxAliveTime: "",
 		pingInterval: DefaultPingInterval,
+		handlerQueueSz: 100,
 		onMessage:    handler,
 	}
 
@@ -419,6 +505,7 @@ func NewBybitPublicWebSocket(url string, handler MessageHandler, options ...Webs
 	c := &WebSocket{
 		url:          url,
 		pingInterval: DefaultPingInterval,
+		handlerQueueSz: 100,
 		onMessage:    handler,
 	}
 
@@ -435,36 +522,33 @@ func (b *WebSocket) SetDebug(dbg bool) {
 }
 
 func (b *WebSocket) Connect() *WebSocket {
+	b.dialMux.Lock()
+	defer b.dialMux.Unlock()
+
 	var err error
 	wssUrl := b.url
 	if b.maxAliveTime != "" {
 		wssUrl += "?max_alive_time=" + b.maxAliveTime
 	}
 
-	// Cancel any previous context early.
-	// Important: sendAuth()/SendSubscription() use send(), which checks b.ctx.
-	b.connMux.Lock()
-	oldCancel := b.cancel
-	b.cancel = nil
-	b.ctx = nil
-	b.connMux.Unlock()
-	if oldCancel != nil {
-		oldCancel()
-		// Wait briefly for old goroutines to finish before starting new ones
-		// Use a timeout to avoid blocking indefinitely
-		done := make(chan struct{})
-		go func() {
-			b.wg.Wait()
-			close(done)
-		}()
-		select {
-		case <-done:
-			// Goroutines finished
-		case <-time.After(2 * time.Second):
-			// Timeout - proceed anyway but log
-			if b.debug {
-				fmt.Println(time.Now().Format(tstamp), "Timeout waiting for old goroutines")
-			}
+	// Fully clean up any existing connection first.
+	// This prevents leaked parallel connections when Connect() is called manually.
+	b.cleanupConnection()
+
+	// Wait briefly for old goroutines to finish before starting new ones.
+	// Use a timeout to avoid blocking indefinitely.
+	done := make(chan struct{})
+	go func() {
+		b.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		// Goroutines finished
+	case <-time.After(2 * time.Second):
+		// Timeout - proceed anyway but log
+		if b.debug {
+			fmt.Println(time.Now().Format(tstamp), "Timeout waiting for old goroutines")
 		}
 	}
 
@@ -508,8 +592,16 @@ func (b *WebSocket) Connect() *WebSocket {
 	// Create a fresh context for this connection BEFORE any auth/subscription writes.
 	// Also assign connection with mutex protection and clear shutdown flag.
 	b.connMux.Lock()
-	b.ctx, b.cancel = context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(context.Background())
+	b.ctx, b.cancel = ctx, cancel
 	b.conn = conn
+	b.connID++
+	myConnID := b.connID
+	if b.handlerQueueSz > 0 {
+		b.handlerCh = make(chan string, b.handlerQueueSz)
+	} else {
+		b.handlerCh = nil
+	}
 	b.isShuttingDown = false // Clear shutdown flag on successful connection
 	b.connMux.Unlock()
 
@@ -520,11 +612,18 @@ func (b *WebSocket) Connect() *WebSocket {
 		if err = b.sendAuth(); err != nil {
 			fmt.Println(time.Now().Format(tstamp), "Failed Connection:", fmt.Sprintf("%v", err))
 
-			// Close connection on authentication failure (with mutex protection)
+			// Close connection and cancel context on authentication failure
 			b.setConnected(false)
 			b.connMux.Lock()
+			if b.cancel != nil {
+				b.cancel()
+				b.cancel = nil
+			}
+			b.ctx = nil
+			b.handlerCh = nil
 			if b.conn != nil {
 				b.conn.Close()
+				b.conn = nil
 			}
 			b.connMux.Unlock()
 
@@ -532,9 +631,56 @@ func (b *WebSocket) Connect() *WebSocket {
 		}
 	}
 
-	go b.handleIncomingMessages()
-	go b.monitorConnection()
-	go ping(b)
+	// Start goroutines with wg.Add BEFORE launching to avoid WaitGroup misuse.
+	// Start handler worker if queueing is enabled.
+	b.connMux.RLock()
+	handlerCh := b.handlerCh
+	b.connMux.RUnlock()
+	if handlerCh != nil {
+		b.wg.Add(1)
+		go func(ch chan string) {
+			defer b.wg.Done()
+			for {
+				select {
+				case msg := <-ch:
+					if b.onMessage == nil {
+						continue
+					}
+					handlerErr := func() (err error) {
+						defer func() {
+							if r := recover(); r != nil {
+								err = fmt.Errorf("panic in message handler: %v", r)
+							}
+						}()
+						return b.onMessage(msg)
+					}()
+					if handlerErr != nil {
+						fmt.Println(time.Now().Format(tstamp), "Error handling message:", handlerErr)
+					}
+				case <-ctx.Done():
+					return
+				}
+			}
+		}(handlerCh)
+	}
+
+	b.wg.Add(1)
+	go func() {
+		defer b.wg.Done()
+		b.handleIncomingMessages(ctx, conn, myConnID)
+	}()
+
+	b.wg.Add(1)
+	go func() {
+		defer b.wg.Done()
+		b.monitorConnection(ctx, myConnID)
+	}()
+
+	b.wg.Add(1)
+	go func() {
+		defer b.wg.Done()
+		b.ping(ctx, conn, myConnID)
+	}()
 
 	// Read subtopic under lock to avoid race with SendSubscription
 	b.connMux.RLock()
@@ -549,15 +695,17 @@ func (b *WebSocket) Connect() *WebSocket {
 				fmt.Println(time.Now().Format(tstamp), "Subscription failed, cleaning up resources:", err)
 			}
 
-			// Cancel context to stop goroutines
+			// Cancel context to stop goroutines and close connection (with mutex protection)
+			b.connMux.Lock()
 			if b.cancel != nil {
 				b.cancel()
+				b.cancel = nil
 			}
-
-			// Close connection (with mutex protection)
-			b.connMux.Lock()
+			b.ctx = nil
+			b.handlerCh = nil
 			if b.conn != nil {
 				b.conn.Close()
+				b.conn = nil
 			}
 			b.connMux.Unlock()
 
@@ -570,16 +718,19 @@ func (b *WebSocket) Connect() *WebSocket {
 }
 
 func (b *WebSocket) SendSubscription(args []string) (*WebSocket, error) {
+	// Copy args to avoid aliasing/user mutation races.
+	argsCopy := append([]string(nil), args...)
+
 	// Protect subtopic with connMux since it's accessed during reconnection
 	b.connMux.Lock()
-	b.subtopic = args
+	b.subtopic = argsCopy
 	b.connMux.Unlock()
 
 	reqID := uuid.New().String()
 	subMessage := map[string]interface{}{
 		"req_id": reqID,
 		"op":     "subscribe",
-		"args":   args,
+		"args":   argsCopy,
 	}
 	if b.debug {
 		fmt.Println(time.Now().Format(tstamp), "subscribe msg:", fmt.Sprintf("%v", subMessage["args"]))
@@ -603,15 +754,15 @@ func (b *WebSocket) sendRequest(op string, args map[string]interface{}, headers 
 		"op":     op,
 		"args":   []interface{}{args},
 	}
-	fmt.Println("request headers:", fmt.Sprintf("%v", request["header"]))
-	fmt.Println("request op channel:", fmt.Sprintf("%v", request["op"]))
-	fmt.Println("request msg:", fmt.Sprintf("%v", request["args"]))
+	if b.debug {
+		fmt.Println("request headers:", fmt.Sprintf("%v", request["header"]))
+		fmt.Println("request op channel:", fmt.Sprintf("%v", request["op"]))
+		fmt.Println("request msg:", fmt.Sprintf("%v", request["args"]))
+	}
 	return b.sendAsJson(request)
 }
 
-func ping(b *WebSocket) {
-	b.wg.Add(1)
-	defer b.wg.Done()
+func (b *WebSocket) ping(ctx context.Context, conn *websocket.Conn, id uint64) {
 	if b.debug {
 		fmt.Println(time.Now().Format(tstamp), "Setup ping handler ", b.subtopic)
 	}
@@ -626,19 +777,25 @@ func ping(b *WebSocket) {
 	for {
 		select {
 		case <-ticker.C:
+			// If a newer connection exists, stop pinging this one.
+			if !b.isConnCurrent(id) {
+				return
+			}
 			if b.isConnectedSafe() {
 				// Optimized ping message creation - avoid map allocation and JSON marshaling
 				currentTime := time.Now().Unix()
 				pingMessage := fmt.Sprintf(`{"op":"ping","req_id":"%d"}`, currentTime)
 
-				if err := b.send(pingMessage); err != nil {
+				if err := b.sendOnConn(ctx, conn, id, pingMessage); err != nil {
 					// Use optimized error checking
 					if isConnectionError(err) {
 						if b.debug {
 							fmt.Println(time.Now().Format(tstamp), "Ping detected broken connection, triggering reconnection")
 						}
-						b.setConnected(false)
-						b.triggerReconnect()
+						if b.isConnCurrent(id) {
+							b.setConnected(false)
+							b.triggerReconnect()
+						}
 					} else {
 						fmt.Println("Failed to send ping:", err)
 					}
@@ -649,13 +806,70 @@ func ping(b *WebSocket) {
 				}
 			}
 
-		case <-b.ctx.Done():
+		case <-ctx.Done():
 			if b.debug {
 				fmt.Println(time.Now().Format(tstamp), "Ping context closed, stopping ping ", b.subtopic)
 			}
 			return
 		}
 	}
+}
+
+// sendOnConn writes a message on a specific connection tied to a specific ctx/connID.
+// This prevents old goroutines from writing to a newer connection after reconnect.
+func (b *WebSocket) sendOnConn(ctx context.Context, conn *websocket.Conn, id uint64, message string) error {
+	b.connMux.RLock()
+	shuttingDown := b.isShuttingDown
+	connected := b.isConnected
+	current := b.connID == id && b.conn == conn
+	b.connMux.RUnlock()
+
+	if shuttingDown {
+		return fmt.Errorf("connection shutting down")
+	}
+	if ctx != nil && ctx.Err() != nil {
+		return fmt.Errorf("context closed")
+	}
+	if !connected {
+		return fmt.Errorf("websocket not connected")
+	}
+	if conn == nil {
+		return fmt.Errorf("connection is nil")
+	}
+	if !current {
+		return fmt.Errorf("stale connection")
+	}
+
+	b.sendMux.Lock()
+	defer b.sendMux.Unlock()
+
+	// Re-check after acquiring send lock to avoid writing to a swapped-out connection.
+	b.connMux.RLock()
+	shuttingDown = b.isShuttingDown
+	connected = b.isConnected
+	current = b.connID == id && b.conn == conn
+	b.connMux.RUnlock()
+	if shuttingDown {
+		return fmt.Errorf("connection shutting down")
+	}
+	if ctx != nil && ctx.Err() != nil {
+		return fmt.Errorf("context closed")
+	}
+	if !connected {
+		return fmt.Errorf("websocket not connected")
+	}
+	if !current {
+		return fmt.Errorf("stale connection")
+	}
+
+	if err := conn.SetWriteDeadline(time.Now().Add(DefaultWriteTimeout * time.Second)); err != nil && b.debug {
+		fmt.Println(time.Now().Format(tstamp), "SetWriteDeadline error:", err)
+	}
+
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(message)); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (b *WebSocket) Disconnect() error {
@@ -670,8 +884,10 @@ func (b *WebSocket) Disconnect() error {
 			b.cancel = nil // Clear for consistency with cleanupConnection
 		}
 		b.ctx = nil
+		b.handlerCh = nil
 		b.isConnected = false
 		if b.conn != nil {
+			b.connID++ // Invalidate in-flight goroutines tied to the old connection
 			err = b.conn.Close()
 			b.conn = nil
 		}
@@ -778,20 +994,50 @@ func (b *WebSocket) send(message string) error {
 
 	// Now acquire send lock for actual I/O operation
 	b.sendMux.Lock()
-	defer b.sendMux.Unlock()
+
+	// Re-check state after acquiring send lock to avoid writing to a stale connection
+	b.connMux.RLock()
+	currentConn := b.conn
+	currentCtx := b.ctx
+	currentConnected := b.isConnected
+	currentShuttingDown := b.isShuttingDown
+	b.connMux.RUnlock()
+	if currentShuttingDown {
+		b.sendMux.Unlock()
+		return fmt.Errorf("connection shutting down")
+	}
+	if currentCtx != nil && currentCtx.Err() != nil {
+		b.sendMux.Unlock()
+		return fmt.Errorf("context closed")
+	}
+	if !currentConnected {
+		b.sendMux.Unlock()
+		return fmt.Errorf("websocket not connected")
+	}
+	if currentConn == nil {
+		b.sendMux.Unlock()
+		return fmt.Errorf("connection is nil")
+	}
+	if currentConn != conn || currentCtx != ctx {
+		b.sendMux.Unlock()
+		return fmt.Errorf("stale connection")
+	}
 
 	// Set write deadline for persistent connection reliability
 	if err := conn.SetWriteDeadline(time.Now().Add(DefaultWriteTimeout * time.Second)); err != nil && b.debug {
 		fmt.Println(time.Now().Format(tstamp), "SetWriteDeadline error:", err)
 	}
 
-	if err := conn.WriteMessage(websocket.TextMessage, []byte(message)); err != nil {
-		// Use optimized error checking for network errors
-		if isConnectionError(err) {
+	writeErr := conn.WriteMessage(websocket.TextMessage, []byte(message))
+	b.sendMux.Unlock()
+	if writeErr != nil {
+		// Use optimized error checking for network errors.
+		// Do NOT acquire connMux while holding sendMux (lock hierarchy).
+		if isConnectionError(writeErr) {
 			b.setConnected(false)
 			b.triggerReconnect()
 		}
-		return err
+		return writeErr
 	}
 	return nil
 }
